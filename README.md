@@ -1,92 +1,54 @@
 # inject
 --
-    import "github.com/codegangsta/inject"
+    import "github.com/shima-park/inject"
 
 Package inject provides utilities for mapping and injecting dependencies in
 various ways.
 
-Language Translations:
-* [简体中文](translations/README_zh_cn.md)
-
 ## Usage
 
-#### func  InterfaceOf
+#### 说明
+原始分支基于reflect.Type作为key，reflect.Value作为value进行存储，并以此注入
+本分支在原始基础上进行了改造，Invoke不再支持任意类型,而只支持传递结构体/结构体指针类型
 
-```go
-func InterfaceOf(value interface{}) reflect.Type
-```
-InterfaceOf dereferences a pointer to an Interface type. It panics if value is
-not an pointer to an interface.
+类型依赖注入
+``` go
+    type TestStruct struct {
+	    Dep1 string        `inject`
+	    Dep2 SpecialString `inject`
+	    Dep3 string        `inject:"t"`
+        Dep4 string
+    }
 
-#### type Applicator
+    injector.Map("a dep", "Dep1")
+    injector.MapTo("another dep", "Dep2", (*SpecialString)(nil))
+    injector.Map("a dep3", "t")
 
-```go
-type Applicator interface {
-	// Maps dependencies in the Type map to each field in the struct
-	// that is tagged with 'inject'. Returns an error if the injection
-	// fails.
-	Apply(interface{}) error
-}
-```
+	s := TestStruct{}
+	injector.Apply(&s)
 
-Applicator represents an interface for mapping dependencies to a struct.
 
-#### type Injector
-
-```go
-type Injector interface {
-	Applicator
-	Invoker
-	TypeMapper
-	// SetParent sets the parent of the injector. If the injector cannot find a
-	// dependency in its Type map it will check its parent before returning an
-	// error.
-	SetParent(Injector)
-}
+    fmt.Println(s.Dep1) // "a dep"
+    fmt.Println(s.Dep2) // "another dep"
+    fmt.Println(s.Dep3) // "a dep3"
+    fmt.Println(s.Dep4) // ""
 ```
 
-Injector represents an interface for mapping and injecting dependencies into
-structs and function arguments.
+方法依赖注入(只支持传递结构体/结构体指针类型)
+``` go
+    type TestStruct struct {
+	    Dep1 string        `inject:"t" json:"-"`
+	    Dep2 SpecialString `inject`
+	    Dep3 string
+    }
 
-#### func  New
+    injector.Invoke(func(s *TestStruct, s2 TestStruct) {
+		fmt.Println(s.Dep1) // "a dep"
+        fmt.Println(s.Dep2) // "another dep"
+        fmt.Println(s.Dep3) // ""
 
-```go
-func New() Injector
+        fmt.Println(s2.Dep1) // "a dep"
+        fmt.Println(s2.Dep2) // "another dep"
+        fmt.Println(s2.Dep3) // ""
+	})
 ```
-New returns a new Injector.
-
-#### type Invoker
-
-```go
-type Invoker interface {
-	// Invoke attempts to call the interface{} provided as a function,
-	// providing dependencies for function arguments based on Type. Returns
-	// a slice of reflect.Value representing the returned values of the function.
-	// Returns an error if the injection fails.
-	Invoke(interface{}) ([]reflect.Value, error)
-}
-```
-
-Invoker represents an interface for calling functions via reflection.
-
-#### type TypeMapper
-
-```go
-type TypeMapper interface {
-	// Maps the interface{} value based on its immediate type from reflect.TypeOf.
-	Map(interface{}) TypeMapper
-	// Maps the interface{} value based on the pointer of an Interface provided.
-	// This is really only useful for mapping a value as an interface, as interfaces
-	// cannot at this time be referenced directly without a pointer.
-	MapTo(interface{}, interface{}) TypeMapper
-	// Provides a possibility to directly insert a mapping based on type and value.
-	// This makes it possible to directly map type arguments not possible to instantiate
-	// with reflect like unidirectional channels.
-	Set(reflect.Type, reflect.Value) TypeMapper
-	// Returns the Value that is mapped to the current type. Returns a zeroed Value if
-	// the Type has not been mapped.
-	Get(reflect.Type) reflect.Value
-}
-```
-
-TypeMapper represents an interface for mapping interface{} values based on type.

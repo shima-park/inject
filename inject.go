@@ -38,22 +38,22 @@ type Invoker interface {
 // TypeMapper represents an interface for mapping interface{} values based on type.
 type TypeMapper interface {
 	// Maps the interface{} value based on its immediate type from reflect.TypeOf.
-	Map(interface{}) TypeMapper
+	Map(value interface{}, name string) TypeMapper
 	// Maps the interface{} value based on the pointer of an Interface provided.
 	// This is really only useful for mapping a value as an interface, as interfaces
 	// cannot at this time be referenced directly without a pointer.
-	MapTo(interface{}, interface{}) TypeMapper
+	MapTo(value interface{}, name string, ifacePtr interface{}) TypeMapper
 	// Provides a possibility to directly insert a mapping based on type and value.
 	// This makes it possible to directly map type arguments not possible to instantiate
 	// with reflect like unidirectional channels.
-	Set(reflect.Type, reflect.Value) TypeMapper
+	Set(typ reflect.Type, name string, value reflect.Value) TypeMapper
 	// Returns the Value that is mapped to the current type. Returns a zeroed Value if
 	// the Type has not been mapped.
-	Get(reflect.Type) reflect.Value
+	Get(typ reflect.Type, name string) reflect.Value
 }
 
 type injector struct {
-	values map[reflect.Type]reflect.Value
+	values map[reflect.Type]map[string]reflect.Value
 	parent Injector
 }
 
@@ -76,7 +76,7 @@ func InterfaceOf(value interface{}) reflect.Type {
 // New returns a new Injector.
 func New() Injector {
 	return &injector{
-		values: make(map[reflect.Type]reflect.Value),
+		values: make(map[reflect.Type]map[string]reflect.Value),
 	}
 }
 
@@ -91,9 +91,22 @@ func (inj *injector) Invoke(f interface{}) ([]reflect.Value, error) {
 	var in = make([]reflect.Value, t.NumIn()) //Panic if t is not kind of Func
 	for i := 0; i < t.NumIn(); i++ {
 		argType := t.In(i)
-		val := inj.Get(argType)
-		if !val.IsValid() {
-			return nil, fmt.Errorf("Value not found for type %v", argType)
+
+		for argType.Kind() == reflect.Ptr {
+			argType = argType.Elem()
+		}
+
+		if argType.Kind() != reflect.Struct {
+			return nil, fmt.Errorf("Cannot support types other than structures %v", argType)
+		}
+
+		val := reflect.New(argType)
+
+		// TODO 结构体中字段在容器中找不到是否panic，或者报错
+		inj.Apply(val.Interface())
+
+		if t.In(i).Kind() == reflect.Struct { // 请求参数需要struct而不是ptr准换一下
+			val = val.Elem()
 		}
 
 		in[i] = val
@@ -122,8 +135,13 @@ func (inj *injector) Apply(val interface{}) error {
 		f := v.Field(i)
 		structField := t.Field(i)
 		if f.CanSet() && (structField.Tag == "inject" || structField.Tag.Get("inject") != "") {
+			name := structField.Tag.Get("inject")
+			if name == "" {
+				name = structField.Name
+			}
+
 			ft := f.Type()
-			v := inj.Get(ft)
+			v := inj.Get(ft, name)
 			if !v.IsValid() {
 				return fmt.Errorf("Value not found for type %v", ft)
 			}
@@ -138,25 +156,37 @@ func (inj *injector) Apply(val interface{}) error {
 
 // Maps the concrete value of val to its dynamic type using reflect.TypeOf,
 // It returns the TypeMapper registered in.
-func (i *injector) Map(val interface{}) TypeMapper {
-	i.values[reflect.TypeOf(val)] = reflect.ValueOf(val)
+func (i *injector) Map(val interface{}, name string) TypeMapper {
+	typ := reflect.TypeOf(val)
+	i.findMap(typ)[name] = reflect.ValueOf(val)
 	return i
 }
 
-func (i *injector) MapTo(val interface{}, ifacePtr interface{}) TypeMapper {
-	i.values[InterfaceOf(ifacePtr)] = reflect.ValueOf(val)
+func (i *injector) MapTo(val interface{}, name string, ifacePtr interface{}) TypeMapper {
+	typ := InterfaceOf(ifacePtr)
+	i.findMap(typ)[name] = reflect.ValueOf(val)
 	return i
 }
 
 // Maps the given reflect.Type to the given reflect.Value and returns
 // the Typemapper the mapping has been registered in.
-func (i *injector) Set(typ reflect.Type, val reflect.Value) TypeMapper {
-	i.values[typ] = val
+func (i *injector) Set(typ reflect.Type, name string, val reflect.Value) TypeMapper {
+	i.findMap(typ)[name] = val
 	return i
 }
 
-func (i *injector) Get(t reflect.Type) reflect.Value {
-	val := i.values[t]
+func (i *injector) findMap(typ reflect.Type) map[string]reflect.Value {
+	var m map[string]reflect.Value
+	var ok bool
+	if m, ok = i.values[typ]; !ok {
+		m = map[string]reflect.Value{}
+		i.values[typ] = m
+	}
+	return m
+}
+
+func (i *injector) Get(t reflect.Type, name string) reflect.Value {
+	val := i.findMap(t)[name]
 
 	if val.IsValid() {
 		return val
@@ -165,17 +195,19 @@ func (i *injector) Get(t reflect.Type) reflect.Value {
 	// no concrete types found, try to find implementors
 	// if t is an interface
 	if t.Kind() == reflect.Interface {
-		for k, v := range i.values {
-			if k.Implements(t) {
-				val = v
-				break
+		for k, m := range i.values {
+			for n, v := range m {
+				if n == name && k.Implements(t) {
+					val = v
+					break
+				}
 			}
 		}
 	}
 
 	// Still no type found, try to look it up on the parent
 	if !val.IsValid() && i.parent != nil {
-		val = i.parent.Get(t)
+		val = i.parent.Get(t, name)
 	}
 
 	return val
