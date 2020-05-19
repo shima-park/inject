@@ -102,8 +102,9 @@ func (inj *injector) Invoke(f interface{}) ([]reflect.Value, error) {
 
 		val := reflect.New(argType)
 
-		// TODO 结构体中字段在容器中找不到是否panic，或者报错
-		inj.Apply(val.Interface())
+		if err := inj.Apply(val.Interface()); err != nil {
+			return nil, err
+		}
 
 		if t.In(i).Kind() == reflect.Struct { // 请求参数需要struct而不是ptr准换一下
 			val = val.Elem()
