@@ -143,7 +143,7 @@ func (inj *injector) Apply(val interface{}) error {
 			ft := f.Type()
 			v := inj.Get(ft, name)
 			if !v.IsValid() {
-				return fmt.Errorf("Value not found for type %v", ft)
+				return fmt.Errorf("Value not found for type: %v name: %v", ft, name)
 			}
 
 			f.Set(v)
