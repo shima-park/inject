@@ -50,6 +50,8 @@ type TypeMapper interface {
 	// Returns the Value that is mapped to the current type. Returns a zeroed Value if
 	// the Type has not been mapped.
 	Get(typ reflect.Type, name string) reflect.Value
+
+	Exists(typ reflect.Type, name string) bool
 }
 
 type injector struct {
@@ -213,6 +215,31 @@ func (i *injector) Get(t reflect.Type, name string) reflect.Value {
 
 	return val
 
+}
+
+func (i *injector) Exists(t reflect.Type, name string) bool {
+	_, ok := i.findMap(t)[name]
+	if ok {
+		return true
+	}
+
+	// no concrete types found, try to find implementors
+	// if t is an interface
+	if t.Kind() == reflect.Interface {
+		for k, m := range i.values {
+			for n, _ := range m {
+				if n == name && k.Implements(t) {
+					return true
+				}
+			}
+		}
+	}
+
+	if i.parent != nil {
+		return i.parent.Exists(t, name)
+	}
+
+	return false
 }
 
 func (i *injector) SetParent(parent Injector) {
