@@ -4,7 +4,11 @@ package inject
 import (
 	"fmt"
 	"reflect"
+	"strings"
+	"sync"
 )
+
+var errorInterface = reflect.TypeOf((*error)(nil)).Elem()
 
 // Injector represents an interface for mapping and injecting dependencies into structs
 // and function arguments.
@@ -51,10 +55,11 @@ type TypeMapper interface {
 	// the Type has not been mapped.
 	Get(typ reflect.Type, name string) reflect.Value
 
-	Exists(typ reflect.Type, name string) bool
+	MapValues(vals ...reflect.Value) error
 }
 
 type injector struct {
+	lock   sync.RWMutex
 	values map[reflect.Type]map[string]reflect.Value
 	parent Injector
 }
@@ -137,19 +142,18 @@ func (inj *injector) Apply(val interface{}) error {
 	for i := 0; i < v.NumField(); i++ {
 		f := v.Field(i)
 		structField := t.Field(i)
-		if f.CanSet() && (structField.Tag == "inject" || structField.Tag.Get("inject") != "") {
-			name := structField.Tag.Get("inject")
-			if name == "" {
-				name = structField.Name
-			}
-
+		ia := GetInjectAnnotation(structField)
+		if f.CanSet() && ia.Exists {
 			ft := f.Type()
-			v := inj.Get(ft, name)
-			if !v.IsValid() {
-				return fmt.Errorf("Value not found for type: %v name: %v", ft, name)
-			}
+			v := inj.Get(ft, ia.Name)
 
-			f.Set(v)
+			if v.IsValid() {
+				f.Set(v)
+			} else {
+				if !ia.Options.Contains(InjectTagOptionsOptional) {
+					return fmt.Errorf("Value not found for type: %v name: %v", ft, ia.Name)
+				}
+			}
 		}
 
 	}
@@ -160,37 +164,47 @@ func (inj *injector) Apply(val interface{}) error {
 // Maps the concrete value of val to its dynamic type using reflect.TypeOf,
 // It returns the TypeMapper registered in.
 func (i *injector) Map(val interface{}, name string) TypeMapper {
-	typ := reflect.TypeOf(val)
-	i.findMap(typ)[name] = reflect.ValueOf(val)
-	return i
+	return i.Set(reflect.TypeOf(val), name, reflect.ValueOf(val))
 }
 
 func (i *injector) MapTo(val interface{}, name string, ifacePtr interface{}) TypeMapper {
-	typ := InterfaceOf(ifacePtr)
-	i.findMap(typ)[name] = reflect.ValueOf(val)
-	return i
+	return i.Set(InterfaceOf(ifacePtr), name, reflect.ValueOf(val))
 }
 
 // Maps the given reflect.Type to the given reflect.Value and returns
 // the Typemapper the mapping has been registered in.
 func (i *injector) Set(typ reflect.Type, name string, val reflect.Value) TypeMapper {
-	i.findMap(typ)[name] = val
-	return i
+	return i.set(typ, name, val)
 }
 
-func (i *injector) findMap(typ reflect.Type) map[string]reflect.Value {
+func (i *injector) get(typ reflect.Type, name string) (val reflect.Value) {
+	i.lock.RLock()
+	defer i.lock.RUnlock()
+
+	if m, ok := i.values[typ]; ok {
+		val = m[name]
+		return
+	}
+	return
+}
+
+func (i *injector) set(typ reflect.Type, name string, val reflect.Value) TypeMapper {
+	i.lock.Lock()
+	defer i.lock.Unlock()
+
 	var m map[string]reflect.Value
 	var ok bool
 	if m, ok = i.values[typ]; !ok {
 		m = map[string]reflect.Value{}
 		i.values[typ] = m
 	}
-	return m
+
+	m[name] = val
+	return i
 }
 
 func (i *injector) Get(t reflect.Type, name string) reflect.Value {
-	val := i.findMap(t)[name]
-
+	val := i.get(t, name)
 	if val.IsValid() {
 		return val
 	}
@@ -198,6 +212,7 @@ func (i *injector) Get(t reflect.Type, name string) reflect.Value {
 	// no concrete types found, try to find implementors
 	// if t is an interface
 	if t.Kind() == reflect.Interface {
+		i.lock.RLock()
 		for k, m := range i.values {
 			for n, v := range m {
 				if n == name && k.Implements(t) {
@@ -206,6 +221,7 @@ func (i *injector) Get(t reflect.Type, name string) reflect.Value {
 				}
 			}
 		}
+		i.lock.RUnlock()
 	}
 
 	// Still no type found, try to look it up on the parent
@@ -214,34 +230,103 @@ func (i *injector) Get(t reflect.Type, name string) reflect.Value {
 	}
 
 	return val
-
-}
-
-func (i *injector) Exists(t reflect.Type, name string) bool {
-	_, ok := i.findMap(t)[name]
-	if ok {
-		return true
-	}
-
-	// no concrete types found, try to find implementors
-	// if t is an interface
-	if t.Kind() == reflect.Interface {
-		for k, m := range i.values {
-			for n, _ := range m {
-				if n == name && k.Implements(t) {
-					return true
-				}
-			}
-		}
-	}
-
-	if i.parent != nil {
-		return i.parent.Exists(t, name)
-	}
-
-	return false
 }
 
 func (i *injector) SetParent(parent Injector) {
 	i.parent = parent
+}
+
+func (i *injector) MapValues(vals ...reflect.Value) error {
+	for _, val := range vals {
+		// 处理返回值中带error的情况
+		if val.Type().Implements(errorInterface) && !val.IsNil() {
+			return val.Interface().(error)
+		}
+
+		// 获取返回值中struct的部分
+		for val.Kind() == reflect.Ptr {
+			val = val.Elem()
+		}
+
+		if val.Kind() != reflect.Struct {
+			continue
+		}
+
+		typ := val.Type()
+
+		for k := 0; k < val.NumField(); k++ {
+			f := val.Field(k)
+			structField := typ.Field(k)
+			ia := GetInjectAnnotation(structField)
+			if f.IsValid() && ia.Exists {
+				if f.Type().Kind() == reflect.Interface {
+					nilPtr := reflect.New(f.Type())
+					i.MapTo(f.Interface(), ia.Name, nilPtr.Interface())
+				} else {
+					i.Set(f.Type(), ia.Name, f)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+const (
+	InjectTagKey             = "inject"
+	InjectTagOptionsOptional = "optional"
+)
+
+type InjectAnnotation struct {
+	Name    string
+	Options TagOptions
+	Exists  bool
+}
+
+func GetInjectAnnotation(structField reflect.StructField) InjectAnnotation {
+	tag := structField.Tag
+	tagVal := tag.Get(InjectTagKey)
+	if tag == InjectTagKey || tagVal != "" {
+		var name string
+		var options TagOptions
+		if tagVal == "" {
+			name = structField.Name
+		} else {
+			name, options = ParseTag(tagVal)
+		}
+
+		return InjectAnnotation{
+			Name:    name,
+			Options: options,
+			Exists:  true,
+		}
+	}
+	return InjectAnnotation{}
+}
+
+type TagOptions string
+
+func ParseTag(tag string) (string, TagOptions) {
+	if idx := strings.Index(tag, ","); idx != -1 {
+		return tag[:idx], TagOptions(tag[idx+1:])
+	}
+	return tag, TagOptions("")
+}
+
+func (o TagOptions) Contains(optionName string) bool {
+	if len(o) == 0 {
+		return false
+	}
+	s := string(o)
+	for s != "" {
+		var next string
+		i := strings.Index(s, ",")
+		if i >= 0 {
+			s, next = s[:i], s[i+1:]
+		}
+		if s == optionName {
+			return true
+		}
+		s = next
+	}
+	return false
 }
